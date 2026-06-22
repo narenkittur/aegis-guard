@@ -46,7 +46,7 @@ import re
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from presidio_analyzer import AnalyzerEngine, RecognizerResult
+from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 
 from backend.app.database import get_original, store_mapping
@@ -63,6 +63,8 @@ _ENTITIES: list[str] = [
     "PERSON",
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
+    "LOCATION",
+    "ORDER_ID",
 ]
 
 # Regex that matches any token produced by this scrubber.
@@ -123,6 +125,53 @@ def _get_engines() -> _Engines:
     nlp_engine = provider.create_engine()
 
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+
+    # ── Custom Address Recognizer ──
+    # Base regex for addresses with generic suffixes
+    address_pattern_base = Pattern(
+        name="street_address_base",
+        regex=r"\b\d{1,5}\s(?:[A-Z][a-z0-9]+\s?){1,3}(?:Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct)\b",
+        score=0.85,
+    )
+    # High-confidence regex for highly common suffixes (Street, Ave, Rd)
+    address_pattern_high = Pattern(
+        name="street_address_high",
+        regex=r"\b\d{1,5}\s(?:[A-Z][a-z0-9]+\s?){1,3}(?:Street|St|Avenue|Ave|Road|Rd)\b",
+        score=0.95,
+    )
+    address_recognizer = PatternRecognizer(
+        supported_entity="LOCATION",
+        patterns=[address_pattern_high, address_pattern_base],
+        context=["address", "sent to", "lives at", "located", "ship to"],
+    )
+    analyzer.registry.add_recognizer(address_recognizer)
+
+    # ── Custom Order Number Recognizer ──
+    # Regex specifically looks for the hash symbol followed by digits
+    order_pattern = Pattern(
+        name="order_number",
+        regex=r"#\d+",
+        score=0.8,
+    )
+    order_recognizer = PatternRecognizer(
+        supported_entity="ORDER_ID",
+        patterns=[order_pattern],
+    )
+    analyzer.registry.add_recognizer(order_recognizer)
+
+    # ── Custom Phone Number Recognizer ──
+    # Matches 7 to 15 digit numbers including optional country and area codes
+    phone_pattern = Pattern(
+        name="phone_number",
+        regex=r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b",
+        score=0.85,
+    )
+    phone_recognizer = PatternRecognizer(
+        supported_entity="PHONE_NUMBER",
+        patterns=[phone_pattern],
+        context=["phone", "cell", "call", "contact", "mobile", "reach"],
+    )
+    analyzer.registry.add_recognizer(phone_recognizer)
 
     _ENGINES = _Engines(analyzer=analyzer)
     logger.info("Presidio engines ready.")
@@ -230,8 +279,47 @@ def _analyse(text: str) -> list[_Span]:
         score_threshold=_MIN_SCORE,
     )
 
-    # Sort by score descending so the best result wins overlaps.
-    results.sort(key=lambda r: r.score, reverse=True)
+    # ── Post-Process Results (Conflict Resolver) ──
+    # The 'Street' Rule: Convert PERSON to LOCATION if followed by a street suffix
+    suffix_pattern = re.compile(
+        r"^\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct)\b",
+        re.IGNORECASE,
+    )
+    for r in results:
+        if r.entity_type == "PERSON":
+            following_text = text[r.end :]
+            suffix_match = suffix_pattern.match(following_text)
+            if suffix_match:
+                r.entity_type = "LOCATION"
+                # Expand forwards to include the street suffix
+                r.end += suffix_match.end()
+                # Expand backwards to grab the street number (e.g., '221B ')
+                prefix = text[: r.start]
+                number_match = re.search(r"\b\d+[a-zA-Z]?\s+$", prefix)
+                if number_match:
+                    r.start = number_match.start()
+
+    # The Overlap Rule: Delete PERSON if it overlaps with a LOCATION
+    location_spans = [set(range(r.start, r.end)) for r in results if r.entity_type == "LOCATION"]
+    filtered_results = []
+    for r in results:
+        if r.entity_type == "PERSON":
+            span_chars = set(range(r.start, r.end))
+            if any(span_chars & loc_span for loc_span in location_spans):
+                continue  # Drop this PERSON entity
+        filtered_results.append(r)
+    results = filtered_results
+
+    # Sort by score descending, then by entity priority (LOCATION wins over PERSON), then span length
+    priority = {"LOCATION": 2, "ORDER_ID": 1, "PERSON": 0}
+    results.sort(
+        key=lambda r: (
+            r.score,
+            priority.get(r.entity_type, 0),
+            r.end - r.start,
+        ),
+        reverse=True,
+    )
 
     # Greedy non-overlap filter.
     accepted: list[RecognizerResult] = []
