@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -56,6 +57,22 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# ── Poppler helper for Windows OCR path discovery ────────────────────────────
+
+_WINDOWS_POPPLER_PATH: Final[str] = r"C:\Program Files\poppler\Release-24.08.0-0\Library\bin"
+
+
+def _ensure_poppler_on_path() -> None:
+    """Ensure the Windows Poppler bin directory is present in PATH."""
+    if os.name != "nt":
+        return
+
+    current_path = os.environ.get("PATH", "")
+    if _WINDOWS_POPPLER_PATH not in current_path:
+        os.environ["PATH"] = f"{current_path};{_WINDOWS_POPPLER_PATH}" if current_path else _WINDOWS_POPPLER_PATH
+        logger.info("Added Poppler to PATH: %s", _WINDOWS_POPPLER_PATH)
+
 
 # ── Public sentinel for known MIME types ──────────────────────────────────────
 
@@ -288,12 +305,14 @@ def _extract_from_pdf_bytes(file_bytes: bytes) -> tuple[str, int, list[str]]:
 
     warnings: list[str] = []
 
+    _ensure_poppler_on_path()
     try:
         pages: list[Image.Image] = convert_from_bytes(
             file_bytes,
             dpi=200,           # 200 DPI: good OCR quality without excessive RAM
             fmt="jpeg",        # JPEG in memory — lower RAM than raw BMP
-            thread_count=1,    # Single-threaded: predictable in async context
+            thread_count=1,  
+            poppler_path=r"C:\Program Files\poppler\poppler-26.02.0\Library\bin"  # Single-threaded: predictable in async context
         )
     except PDFInfoNotInstalledError as exc:
         raise OcrError(

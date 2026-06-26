@@ -26,7 +26,7 @@ import sys
 import time
 from typing import Dict, Optional, Union
 
-import google.genai as genai
+from openai import AsyncOpenAI
 import httpx
 from dotenv import load_dotenv
 
@@ -49,15 +49,18 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 settings = get_settings()
 
-# Initialize Gemini SDK
-_genai_client: genai.Client | None = None
+# Initialize OpenRouter SDK
+_openai_client: AsyncOpenAI | None = None
 if settings.llm_api_key:
-    _genai_client = genai.Client(api_key=settings.llm_api_key)
+    _openai_client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=settings.llm_api_key,
+    )
 else:
     logger.warning("LLM_API_KEY is missing! Set it in your .env file.")
 
-# We use gemini-3.1-flash-lite as it provides a generous free tier limit.
-_GEMINI_MODEL = "gemini-2.0-flash"
+# We use gpt-oss-20b
+_LLM_MODEL = "openai/gpt-oss-20b"
 _SCRUB_URL = "http://127.0.0.1:8000/api/v1/scrub"
 _RESTORE_URL = "http://127.0.0.1:8000/api/v1/restore"
 
@@ -125,6 +128,7 @@ async def process_secure_request(
             logger.error("Unexpected error in Aegis-Vision: %s", exc)
             raise RuntimeError(f"OCR pipeline failure: {exc}") from exc
 
+        assert ocr_result is not None, "OCR result cannot be None after successful extraction."
         text_for_scrubber = ocr_result.raw_text
         logger.info(
             "STEP 0 complete: %d page(s) extracted in %.0f ms — %d char(s) of raw text.",
@@ -162,27 +166,33 @@ async def process_secure_request(
         logger.info("CLOUD OUTBOUND: %s", scrubbed_text)
         logger.info("==========================================")
 
-        # ── STEP 3: Send the scrubbed text to Gemini ─────────────────────────
-        logger.info("STEP 3: Sending scrubbed payload to %s...", _GEMINI_MODEL)
-        if not _genai_client:
-            raise RuntimeError("LLM_API_KEY not configured — cannot call Gemini.")
+        # ── STEP 3: Send the scrubbed text to OpenRouter ─────────────────────────
+        logger.info("STEP 3: Sending scrubbed payload to %s...", _LLM_MODEL)
+        llm_client = _openai_client
+        if not llm_client:
+            raise RuntimeError("LLM_API_KEY not configured — cannot call OpenRouter.")
         try:
-            loop = asyncio.get_running_loop()
-            gemini_response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model=_GEMINI_MODEL,
-                    contents=scrubbed_text,
-                ),
+            response = await llm_client.chat.completions.create(
+                model=_LLM_MODEL,
+                messages=[
+    {
+        "role": "user", 
+        "content": f"Analyze the following text and provide a direct, concise summary. Do not greet me, do not list options, and do not ask follow-up questions:\n\n{scrubbed_text}"
+    }
+],
             )
-            llm_text: str = gemini_response.text
+            
+            if not response.choices or not response.choices[0].message.content:
+                raise RuntimeError("Cloud LLM returned an empty response (possibly blocked by safety settings).")
+            
+            llm_text: str = response.choices[0].message.content
 
             logger.info("==========================================")
             logger.info("CLOUD INBOUND : %s", llm_text)
             logger.info("==========================================")
 
         except Exception as exc:
-            logger.error("Gemini API call failed. Check your API key and network connection.")
+            logger.error("OpenRouter API call failed. Check your API key and network connection.")
             raise RuntimeError(f"Cloud LLM failure: {exc}") from exc
 
         # ── STEP 4: Call LOCAL restore endpoint ──────────────────────────────

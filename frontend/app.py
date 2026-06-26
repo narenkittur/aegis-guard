@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pandas as pd
 import streamlit as st
-import google.genai as genai
+from openai import OpenAI
 from dotenv import load_dotenv
 
 # ── Configuration & Page Setup ────────────────────────────────────────────────
@@ -15,7 +15,7 @@ st.set_page_config(page_title="Aegis-Guard Core", page_icon="🛡️", layout="w
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 API_KEY = os.getenv("LLM_API_KEY")
-_genai_client = genai.Client(api_key=API_KEY) if API_KEY else None
+_openai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=API_KEY) if API_KEY else None
 
 # ── Backend Base URL ──────────────────────────────────────────────────────────
 _BACKEND = "http://127.0.0.1:8000"
@@ -48,7 +48,7 @@ def call_orchestrate_file(file_bytes: bytes, mime_type: str) -> dict | None:
         response = httpx.post(
             f"{_BACKEND}/api/v1/orchestrate",
             files={"file": ("upload", file_bytes, mime_type)},
-            timeout=60.0,
+            timeout=180.0,
         )
         response.raise_for_status()
         return response.json()
@@ -66,7 +66,7 @@ def call_scrub_api(text: str) -> dict | None:
         response = httpx.post(
             f"{_BACKEND}/api/v1/scrub",
             json={"text": text},
-            timeout=30.0,
+            timeout=180.0,
         )
         response.raise_for_status()
         return response.json()
@@ -78,16 +78,16 @@ def call_scrub_api(text: str) -> dict | None:
         return None
 
 
-def call_gemini(text: str) -> str | None:
-    if not _genai_client:
+def call_llm(text: str) -> str | None:
+    if not _openai_client:
         st.error("LLM_API_KEY is not set in the .env file.")
         return None
     try:
-        res = _genai_client.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=text,
+        res = _openai_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": text}],
         )
-        return res.text
+        return res.choices[0].message.content
     except Exception as e:
         st.error(f"Cloud LLM Failure: {e}")
         return None
@@ -98,7 +98,7 @@ def call_restore_api(text: str) -> dict | None:
         response = httpx.post(
             f"{_BACKEND}/api/v1/restore",
             json={"text": text},
-            timeout=30.0,
+            timeout=180.0,
         )
         response.raise_for_status()
         return response.json()
@@ -116,7 +116,7 @@ st.sidebar.metric("Lifetime Shielded", "1,249", "↑ 12 today")
 st.sidebar.metric("Active Vaults", "3", None)
 st.sidebar.markdown("---")
 
-st.sidebar.caption("spaCy | Presidio | GLiNER | EasyOCR | Gemini-3.1-Flash-Lite")
+st.sidebar.caption("spaCy | Presidio | GLiNER | EasyOCR | gpt-oss-20b")
 
 
 # ── Session State ─────────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ with tab1:
         else:
             start_time = time.time()
 
-            if has_file:
+            if uploaded_file is not None:
                 # ── FILE PATH: route through /api/v1/orchestrate ──────────────
                 file_bytes = uploaded_file.read()
                 mime_type = uploaded_file.type or "application/octet-stream"
@@ -211,7 +211,7 @@ with tab1:
                     st.success("### Final Rehydrated Output\n\n" + final_text)
 
             else:
-                # ── TEXT PATH: existing scrub → Gemini → restore pipeline ─────
+                # ── TEXT PATH: existing scrub → LLM → restore pipeline ─────
                 with st.spinner("Scrubbing data locally..."):
                     scrub_data = call_scrub_api(prompt_input)
 
@@ -219,8 +219,8 @@ with tab1:
                     st.session_state.raw_prompt    = prompt_input
                     st.session_state.scrubbed_text = scrub_data["scrubbed_text"]
 
-                    with st.spinner("Calling Gemini-3.1-Flash-Lite..."):
-                        llm_response = call_gemini(st.session_state.scrubbed_text)
+                    with st.spinner("Calling gpt-oss-20b..."):
+                        llm_response = call_llm(st.session_state.scrubbed_text)
 
                     if llm_response:
                         with st.spinner("Rehydrating response locally..."):
